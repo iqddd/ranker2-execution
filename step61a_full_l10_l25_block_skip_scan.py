@@ -104,6 +104,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--restart-workspace", action="store_true")
     result.add_argument("--hardware", choices=("auto", "remote"), default="auto")
     result.add_argument("--local-runtime-evidence", type=Path)
+    result.add_argument("--reconstruct-features", action="store_true")
     result.add_argument("--image-dir", type=Path, default=Path("images"))
     result.add_argument("--source-state", type=Path, default=Path("ranking_state.json"))
     result.add_argument("--within-state", type=Path, default=Path("ranking_state_within_identity.json"))
@@ -145,12 +146,16 @@ def _prepare_features(args: argparse.Namespace, device: torch.device) -> tuple[l
             model.cpu()
             torch.cuda.empty_cache()
             return names, residual, pooled, model, manifest
-    if args.hardware == "remote":
+    if args.hardware == "remote" and not args.reconstruct_features:
         raise FileNotFoundError("Remote execution requires prepared L10/pooled scratch inputs.")
     feature_dir.mkdir(parents=True, exist_ok=True)
-    prefix = ExactPrefixCache.load(args.old_prefix, args.extra_prefix)
-    names = list(prefix.names)
-    del prefix
+    if manifest_path.is_file():
+        seed_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        names = list(map(str, seed_manifest["names"]))
+    else:
+        prefix = ExactPrefixCache.load(args.old_prefix, args.extra_prefix)
+        names = list(prefix.names)
+        del prefix
     model, residual, pooled, extraction = extract_l10_workspace(
         names=names,
         image_dir=args.image_dir,
@@ -163,8 +168,8 @@ def _prepare_features(args: argparse.Namespace, device: torch.device) -> tuple[l
         "names": names,
         "extraction": extraction,
         "source_digests": {
-            "old_PRE_LAST": sha256_file(args.old_prefix),
-            "extra_PRE_LAST": sha256_file(args.extra_prefix),
+            "old_PRE_LAST": sha256_file(args.old_prefix) if args.old_prefix.is_file() else "not_used_remote_reconstruction",
+            "extra_PRE_LAST": sha256_file(args.extra_prefix) if args.extra_prefix.is_file() else "not_used_remote_reconstruction",
             "model_weights": sha256_file(args.model_dir / "model.safetensors"),
         },
     }
