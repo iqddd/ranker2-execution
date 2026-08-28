@@ -103,6 +103,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--feature-workspace", type=Path, default=Path("_work/step61a_full_l10_l25_features"))
     result.add_argument("--restart-workspace", action="store_true")
     result.add_argument("--hardware", choices=("auto", "remote"), default="auto")
+    result.add_argument("--local-runtime-evidence", type=Path)
     result.add_argument("--image-dir", type=Path, default=Path("images"))
     result.add_argument("--source-state", type=Path, default=Path("ranking_state.json"))
     result.add_argument("--within-state", type=Path, default=Path("ranking_state_within_identity.json"))
@@ -289,6 +290,8 @@ def main() -> None:
         "training_implementation": Path("ranker/experiments/layer_screen/training.py"),
         "analysis_implementation": Path("ranker/experiments/layer_screen/step61_analysis.py"),
     }
+    if args.local_runtime_evidence is not None:
+        inputs["local_runtime_evidence"] = args.local_runtime_evidence
     resume_contract = {
         "compute_signature": SIGNATURE,
         "layers": LAYERS,
@@ -400,22 +403,30 @@ def main() -> None:
         run.require("backend_matched_L26_parity", all(row["pass"] for row in initialization_rows if row["record_type"] == "backend_matched_one_update_shadow"), "backend_matched_L26_parity_failed")
         run.emit(STEP.artifact_name("initialization_parity"), initialization_rows)
 
-        pilot_payload = run.journal.run("local_pilot", lambda: trajectory_payload(run_multihead_trajectory(template=template, residual_l10_cpu=residual_l10, pooled=pooled, fold=folds[0], seed=SEEDS[0], capture_indices=canonical_indices, checkpoints=CHECKPOINTS, max_updates=512, tick=run.tick)), fold=0, seed=SEEDS[0])
-        pilot = trajectory_from_payload(pilot_payload)
-        eager_seconds = float(
-            eager_diagnostic.get(
-                "runtime_seconds_excluded_from_training_projection", 0.0
-            )
-        )
-        setup_elapsed = time.perf_counter() - started - pilot.elapsed_seconds - eager_seconds
-        projected_local = setup_elapsed + 15.0 * pilot.elapsed_seconds + 300.0
-        local_allowed = projected_local <= 5400.0
-        if args.hardware == "auto" and not local_allowed:
-            run.emit(STEP.artifact_name("runtime_hardware"), {"local_pilot_seconds": pilot.elapsed_seconds, "setup_elapsed_seconds": setup_elapsed, "projected_local_total_seconds": projected_local, "local_limit_seconds": 5400.0, "analytical_hardware": "remote_required", "pilot_in_analytical_panel": False})
-            raise RuntimeError(f"REMOTE_ROUTING_REQUIRED projected_local_total={projected_local:.3f}")
+        pilot = None
+        if args.hardware == "remote":
+            if args.local_runtime_evidence is None:
+                raise ValueError("Remote execution requires --local-runtime-evidence.")
+            local_runtime = json.loads(args.local_runtime_evidence.read_text(encoding="utf-8"))
+            pilot_seconds = float(local_runtime["local_pilot_seconds"])
+            setup_elapsed = float(local_runtime["setup_elapsed_seconds"])
+            projected_local = float(local_runtime["projected_local_total_seconds"])
+            if projected_local <= 5400.0:
+                raise ValueError("Remote execution is forbidden when the recorded local projection is within budget.")
+        else:
+            pilot_payload = run.journal.run("local_pilot", lambda: trajectory_payload(run_multihead_trajectory(template=template, residual_l10_cpu=residual_l10, pooled=pooled, fold=folds[0], seed=SEEDS[0], capture_indices=canonical_indices, checkpoints=CHECKPOINTS, max_updates=512, tick=run.tick)), fold=0, seed=SEEDS[0])
+            pilot = trajectory_from_payload(pilot_payload)
+            pilot_seconds = pilot.elapsed_seconds
+            eager_seconds = float(eager_diagnostic.get("runtime_seconds_excluded_from_training_projection", 0.0))
+            setup_elapsed = time.perf_counter() - started - pilot_seconds - eager_seconds
+            projected_local = setup_elapsed + 15.0 * pilot_seconds + 300.0
+            if projected_local > 5400.0:
+                run.emit(STEP.artifact_name("runtime_hardware"), {"local_pilot_seconds": pilot_seconds, "setup_elapsed_seconds": setup_elapsed, "projected_local_total_seconds": projected_local, "local_limit_seconds": 5400.0, "analytical_hardware": "remote_required", "pilot_in_analytical_panel": False})
+                raise RuntimeError(f"REMOTE_ROUTING_REQUIRED projected_local_total={projected_local:.3f}")
         analytical_hardware = "remote_RTX5090" if args.hardware == "remote" else "local"
         results: dict[tuple[int, int], Any] = {}
         if analytical_hardware == "local":
+            assert pilot is not None
             results[(0, SEEDS[0])] = pilot
         ordered_units = [(fold, seed) for fold in range(5) for seed in SEEDS]
         completed_times: list[float] = []
@@ -440,7 +451,7 @@ def main() -> None:
         run.count("trajectories_completed", len(results), expected=15)
         raw_scores = np.stack([[[results[(fold, seed)].checkpoint_scores[checkpoint] for checkpoint in CHECKPOINTS] for fold in range(5)] for seed in SEEDS])
         run.emit(STEP.artifact_name("scalar_scores"), {"raw_scores": raw_scores, "seeds": np.asarray(SEEDS), "folds": np.arange(5), "checkpoints": np.asarray(CHECKPOINTS), "layers": np.asarray(LAYERS), "image_ids": np.asarray(image_ids), "fold_assignment": assignment})
-        run.emit(STEP.artifact_name("runtime_hardware"), {"local_pilot_seconds": pilot.elapsed_seconds, "setup_elapsed_seconds": setup_elapsed, "projected_local_total_seconds": projected_local, "local_limit_seconds": 5400.0, "analytical_hardware": analytical_hardware, "pilot_in_analytical_panel": analytical_hardware == "local", "trajectory_seconds": [results[key].elapsed_seconds for key in ordered_units]})
+        run.emit(STEP.artifact_name("runtime_hardware"), {"local_pilot_seconds": pilot_seconds, "setup_elapsed_seconds": setup_elapsed, "projected_local_total_seconds": projected_local, "local_limit_seconds": 5400.0, "analytical_hardware": analytical_hardware, "pilot_in_analytical_panel": analytical_hardware == "local", "trajectory_seconds": [results[key].elapsed_seconds for key in ordered_units]})
         run.emit(STEP.artifact_name("trajectory_journal_audit"), {"completed_units": len(results), "expected_units": 15, "journal": run.journal.audit(), "local_pilot_role": "analytical trajectory 0" if analytical_hardware == "local" else "runtime/parity evidence only"})
         run.emit(STEP.artifact_name("endpoint_closure"), closure)
         run.emit(STEP.artifact_name("evaluation_parity"), [{"record_type": "checkpoint", "fold": fold, "seed": seed, "checkpoint": checkpoint, "pass": bool(np.all(np.isfinite(results[(fold, seed)].checkpoint_scores[checkpoint]))), "lossless_helper": "neutral_schedulefree_evaluation", "eval_copy": "independent numpy copy"} for fold, seed in ordered_units for checkpoint in CHECKPOINTS])
