@@ -118,7 +118,11 @@ def _select_feature_rows(
 
 
 def build_screen(
-    *, template: torch.nn.Module, seed: int, device: torch.device
+    *,
+    template: torch.nn.Module,
+    seed: int,
+    device: torch.device,
+    head_layers: Sequence[int] | None = None,
 ) -> tuple[MultiLayerScreen, torch.Tensor, list[torch.Tensor]]:
     """Build identical heads while preserving ordinary one-head RNG history."""
     configure_determinism(seed)
@@ -128,7 +132,9 @@ def build_screen(
     }
     post_factory_cuda_rng = torch.cuda.get_rng_state()
     del ordinary
-    screen = MultiLayerScreen(template=template, seed=seed, device=device)
+    screen = MultiLayerScreen(
+        template=template, seed=seed, device=device, head_layers=head_layers
+    )
     screen.load_shared_head_state(shared_state)
     torch.cuda.set_rng_state(post_factory_cuda_rng)
     rng_streams = [post_factory_cuda_rng.clone() for _ in screen.heads]
@@ -143,6 +149,7 @@ def backend_matched_l26_first_update_parity(
     fold: TrainingFold,
     seed: int,
     capture_indices: torch.Tensor,
+    head_layers: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     """Compare the L26 multihead arm with a one-group STEP60A-style trainer."""
     device = runtime.device
@@ -152,9 +159,10 @@ def backend_matched_l26_first_update_parity(
     if not isinstance(standalone, StandardReadout):
         raise TypeError("Backend-matched L26 shadow requires StandardReadout.")
     screen, _post_factory_rng, head_rng = build_screen(
-        template=template, seed=seed, device=device
+        template=template, seed=seed, device=device, head_layers=head_layers
     )
-    l26 = screen.heads[-1]
+    l26_index = screen.head_layers.index(26)
+    l26 = screen.heads[l26_index]
     assert standalone.linear_weight is not None
     assert standalone.linear_bias is not None
     assert standalone.head is not None
@@ -178,7 +186,7 @@ def backend_matched_l26_first_update_parity(
     ]
     optimizer_state_before_exact = _tree_exact(
         _optimizer_group_state(standalone_optimizer, 0),
-        _optimizer_group_state(multi_optimizers[16], 0),
+        _optimizer_group_state(multi_optimizers[l26_index], 0),
     )
     screen.train(True)
     standalone.head.train(True)
@@ -215,7 +223,7 @@ def backend_matched_l26_first_update_parity(
                 runtime.pooled,
                 capture_indices,
                 batch_size=8,
-            )[-1]
+            )[l26_index]
         ).to(device)
     pre_scores_exact = bool(torch.equal(standalone_pre, multi_pre))
 
@@ -233,7 +241,7 @@ def backend_matched_l26_first_update_parity(
         group_index = sampler.next()
         group = retained[group_index]
         indices = fold.group_indices[(source, group_index)]
-        initial_rng = head_rng[-1].clone()
+        initial_rng = head_rng[l26_index].clone()
         group_residual = _select_feature_rows(residual_l10_cpu, indices, device)
         l26_tokens = screen.capture_l26_tokens(group_residual)
         torch.cuda.set_rng_state(initial_rng)
@@ -251,7 +259,7 @@ def backend_matched_l26_first_update_parity(
                     score, group, source, pair_weighting="REL"
                 )
             )
-            for _ in range(17)
+            for _ in screen.heads
         ]
         multi_losses = screen.score_and_backward(
             group_residual,
@@ -260,8 +268,8 @@ def backend_matched_l26_first_update_parity(
             coefficient,
             head_rng,
         )
-        rng_exact &= torch.equal(standalone_next_rng, head_rng[-1])
-        loss_rows.append((float(standalone_loss.detach()), multi_losses[-1]))
+        rng_exact &= torch.equal(standalone_next_rng, head_rng[l26_index])
+        loss_rows.append((float(standalone_loss.detach()), multi_losses[l26_index]))
 
     loss_exact = all(left == right for left, right in loss_rows)
     l26_parameters = list(l26.parameters())
@@ -284,7 +292,7 @@ def backend_matched_l26_first_update_parity(
     )
     optimizer_state_after_exact = _tree_exact(
         _optimizer_group_state(standalone_optimizer, 0),
-        _optimizer_group_state(multi_optimizers[16], 0),
+        _optimizer_group_state(multi_optimizers[l26_index], 0),
     )
 
     with neutral_schedulefree_evaluation(
@@ -309,7 +317,7 @@ def backend_matched_l26_first_update_parity(
                 runtime.pooled,
                 capture_indices,
                 batch_size=8,
-            )[-1]
+            )[l26_index]
         ).to(device)
     cp1_scores_exact = bool(torch.equal(standalone_cp1, multi_cp1))
     cp1_difference = (standalone_cp1 - multi_cp1).abs()
@@ -383,25 +391,27 @@ def run_multihead_trajectory(
     capture_indices: torch.Tensor,
     checkpoints: Sequence[int],
     max_updates: int,
+    head_layers: Sequence[int] | None = None,
     tick: Callable[[], None] | None = None,
 ) -> MultiLayerTrajectoryResult:
-    """Train 17 independent JOINT4 arms over one frozen suffix stream."""
+    """Train independent selected JOINT4 arms over one frozen suffix stream."""
     evaluation = set(map(int, checkpoints))
     if not evaluation or min(evaluation) != 0 or max(evaluation) != max_updates:
         raise ValueError("Checkpoint grid must contain 0 and max_updates.")
     device = pooled.device
     screen, _post_factory_rng, head_rng = build_screen(
-        template=template, seed=seed, device=device
+        template=template, seed=seed, device=device, head_layers=head_layers
     )
     groups = screen.head_parameter_groups()
     parameters = screen.trainable_parameters()
-    if len(groups) != 17 or len({id(value) for value in parameters}) != len(parameters):
-        raise RuntimeError("Multihead optimizer topology is not 17 disjoint groups.")
+    expected_heads = len(screen.heads)
+    if len(groups) != expected_heads or len({id(value) for value in parameters}) != len(parameters):
+        raise RuntimeError("Multihead optimizer topology is not disjoint by head.")
     optimizers = [ProdigyPlusScheduleFree([group], lr=1.0) for group in groups]
-    if len(optimizers) != 17 or any(
+    if len(optimizers) != expected_heads or any(
         len(optimizer.param_groups) != 1 for optimizer in optimizers
     ):
-        raise RuntimeError("PPSF did not create 17 independent optimizers.")
+        raise RuntimeError("PPSF did not create one independent optimizer per head.")
     screen.train(True)
     o_sampler = CyclingGroupSampler(len(fold.retained_o), seed)
     w_sampler = CyclingGroupSampler(len(fold.retained_w), seed + 1)
@@ -444,7 +454,7 @@ def run_multihead_trajectory(
                         score, group, source, pair_weighting="REL"
                     )
                 )
-                for _ in range(17)
+                for _ in screen.heads
             ]
             source_losses[source] = screen.score_and_backward(
                 residual,
@@ -467,7 +477,7 @@ def run_multihead_trajectory(
                 dynamics.append(
                     {
                         "update": update,
-                        "layer": 10 + layer_offset,
+                        "layer": screen.head_layers[layer_offset],
                         "d": _group_scalar(group, "d"),
                         "effective_lr": _group_scalar(group, "lr"),
                         "gradient_norm": norms[layer_offset],

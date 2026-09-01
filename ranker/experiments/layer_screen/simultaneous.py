@@ -19,7 +19,7 @@ def _require_exact(flags: Sequence[torch.Tensor], labels: Sequence[str]) -> None
     values = torch.stack(tuple(flags)).detach().cpu().tolist()
     for exact, label in zip(values, labels, strict=True):
         if not bool(exact):
-            raise RuntimeError(f"All-efficient parity shadow mismatch at {label}.")
+            raise RuntimeError(f"All-efficient shadow mismatch at {label}.")
 
 
 class LayerJointHead(nn.Module):
@@ -64,10 +64,20 @@ class MultiLayerScreen(nn.Module):
         device: torch.device,
         first_layer: int = 10,
         last_layer: int = 26,
+        head_layers: Sequence[int] | None = None,
     ) -> None:
         super().__init__()
+        if head_layers is None:
+            head_layers = tuple(range(first_layer, last_layer + 1))
+        else:
+            head_layers = tuple(map(int, head_layers))
+            if not head_layers or tuple(sorted(set(head_layers))) != head_layers:
+                raise ValueError("head_layers must be a non-empty sorted unique sequence.")
+            if head_layers[0] < first_layer or head_layers[-1] > last_layer:
+                raise ValueError("head_layers must lie inside the streamed layer range.")
         self.first_layer = int(first_layer)
         self.last_layer = int(last_layer)
+        self.head_layers = tuple(head_layers)
         self.suffix = nn.ModuleList(
             copy.deepcopy(template.encoder.layers[index]).to(device).eval()
             for index in range(first_layer + 1, last_layer + 1)
@@ -81,7 +91,7 @@ class MultiLayerScreen(nn.Module):
             parameter.requires_grad_(False)
         self.heads = nn.ModuleList(
             LayerJointHead(seed=seed, device=device)
-            for _ in range(last_layer - first_layer + 1)
+            for _ in self.head_layers
         )
         initial = self.heads[0].state_dict()
         for head in self.heads[1:]:
@@ -149,31 +159,36 @@ class MultiLayerScreen(nn.Module):
         losses: list[float] = []
         exact_flags: list[torch.Tensor] = []
         exact_labels: list[str] = []
-        for offset, head in enumerate(self.heads):
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                tokens = self.post_layernorm(residual).to(torch.bfloat16)
-                shadow_tokens = self.post_layernorm(shadow).to(torch.bfloat16)
-            exact_flags.append(torch.all(tokens == shadow_tokens))
-            exact_labels.append(f"head tokens layer {self.first_layer + offset}")
-            self.shadow_comparisons += 1
-            if rng_states is not None:
-                torch.cuda.set_rng_state(rng_states[offset])
-            score = head(tokens, pooled)
-            if rng_states is not None:
-                rng_states[offset] = torch.cuda.get_rng_state()
-            loss = loss_callbacks[offset](score)
-            (float(source_weight) * loss).backward()
-            losses.append(float(loss.detach()))
-            if offset < len(self.suffix):
+        head_index = 0
+        for layer in range(self.first_layer, self.last_layer + 1):
+            if layer in self.head_layers:
+                head = self.heads[head_index]
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    tokens = self.post_layernorm(residual).to(torch.bfloat16)
+                    shadow_tokens = self.post_layernorm(shadow).to(torch.bfloat16)
+                exact_flags.append(torch.all(tokens == shadow_tokens))
+                exact_labels.append(f"head tokens layer {layer}")
+                self.shadow_comparisons += 1
+                if rng_states is not None:
+                    torch.cuda.set_rng_state(rng_states[head_index])
+                score = head(tokens, pooled)
+                if rng_states is not None:
+                    rng_states[head_index] = torch.cuda.get_rng_state()
+                loss = loss_callbacks[head_index](score)
+                (float(source_weight) * loss).backward()
+                losses.append(float(loss.detach()))
+                head_index += 1
+            if layer < self.last_layer:
+                block = self.suffix[layer - self.first_layer]
                 with (
                     torch.no_grad(),
                     efficient_sdpa_only(),
                     torch.autocast("cuda", dtype=torch.bfloat16),
                 ):
-                    residual = self.suffix[offset](residual, attention_mask=None)
-                    shadow = self.suffix[offset](shadow, attention_mask=None)
+                    residual = block(residual, attention_mask=None)
+                    shadow = block(shadow, attention_mask=None)
                 exact_flags.append(torch.all(residual == shadow))
-                exact_labels.append(f"raw layer {self.first_layer + offset + 1}")
+                exact_labels.append(f"raw layer {layer + 1}")
         _require_exact(exact_flags, exact_labels)
         return losses
 
@@ -191,27 +206,28 @@ class MultiLayerScreen(nn.Module):
             rows: list[torch.Tensor] = []
             exact_flags: list[torch.Tensor] = []
             exact_labels: list[str] = []
-            for offset, head in enumerate(self.heads):
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    tokens = self.post_layernorm(residual).to(torch.bfloat16)
-                    shadow_tokens = self.post_layernorm(shadow).to(torch.bfloat16)
-                    exact_flags.append(torch.all(tokens == shadow_tokens))
-                    exact_labels.append(
-                        f"evaluation head tokens layer {self.first_layer + offset}"
-                    )
-                    self.shadow_comparisons += 1
-                    rows.append(head(tokens, pooled).float())
-                if offset < len(self.suffix):
+            head_index = 0
+            for layer in range(self.first_layer, self.last_layer + 1):
+                if layer in self.head_layers:
+                    head = self.heads[head_index]
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        tokens = self.post_layernorm(residual).to(torch.bfloat16)
+                        shadow_tokens = self.post_layernorm(shadow).to(torch.bfloat16)
+                        exact_flags.append(torch.all(tokens == shadow_tokens))
+                        exact_labels.append(f"evaluation head tokens layer {layer}")
+                        self.shadow_comparisons += 1
+                        rows.append(head(tokens, pooled).float())
+                    head_index += 1
+                if layer < self.last_layer:
+                    block = self.suffix[layer - self.first_layer]
                     with (
                         efficient_sdpa_only(),
                         torch.autocast("cuda", dtype=torch.bfloat16),
                     ):
-                        residual = self.suffix[offset](residual, attention_mask=None)
-                        shadow = self.suffix[offset](shadow, attention_mask=None)
+                        residual = block(residual, attention_mask=None)
+                        shadow = block(shadow, attention_mask=None)
                     exact_flags.append(torch.all(residual == shadow))
-                    exact_labels.append(
-                        f"evaluation raw layer {self.first_layer + offset + 1}"
-                    )
+                    exact_labels.append(f"evaluation raw layer {layer + 1}")
             _require_exact(exact_flags, exact_labels)
             return torch.stack(rows)
         finally:

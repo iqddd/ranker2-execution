@@ -161,6 +161,7 @@ COMMAND_MODULES = {
     "step60a-matched-image-heldout-horizon-transfer": "step60a_matched_image_heldout_horizon_transfer",
     "step60b-target-heldout-seen-anchor-endpoint-certification": "step60b_target_heldout_seen_anchor_endpoint_certification",
     "step61a-full-l10-l25-block-skip-scan": "step61a_full_l10_l25_block_skip_scan",
+    "step61b-l24-fixed-confirmation": "step61b_l24_fixed_confirmation",
     "step43a-r1-group-oof-production-head": "step43a_r1_group_oof_production_head",
     "explore-prodigy-head": "explore_prodigy_head",
     "step31c-targeted-anchor-panel": "step31c_targeted_anchor_panel",

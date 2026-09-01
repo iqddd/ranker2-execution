@@ -15,7 +15,7 @@ from torch.nn import functional as F
 
 from ranker.attention_runtime import load_vision_model
 from ranker.embeddings import resize_normalize_zero_pad_image
-from ranker.io import atomic_text
+from ranker.io import atomic_json, atomic_text, sha256_file
 from ranker.last_block_finetune import ExactPrefixCache
 from ranker.runtime_preflight import efficient_sdpa_only
 
@@ -26,6 +26,75 @@ def tensor_content_digest(values: torch.Tensor) -> str:
         cpu = cpu.view(torch.uint16)
     array = cpu.numpy()
     return hashlib.sha256(memoryview(array).cast("B")).hexdigest()
+
+
+def prepare_all_efficient_workspace(
+    *,
+    feature_dir: Path,
+    image_dir: Path,
+    model_dir: Path,
+    old_prefix: Path,
+    extra_prefix: Path,
+    device: torch.device,
+    reconstruct: bool,
+    require_prepared: bool,
+    seed_manifest: Path | None = None,
+) -> tuple[list[str], torch.Tensor, torch.Tensor, Any, dict[str, Any]]:
+    """Load or reconstruct the digest-bound all-efficient L10/L26 workspace."""
+    l10_path = feature_dir / "L10_RESIDUAL.npy"
+    pooled_path = feature_dir / "L26_POOLED.npy"
+    manifest_path = feature_dir / "FEATURE_MANIFEST.json"
+    if l10_path.is_file() and pooled_path.is_file() and manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        extraction = manifest.get("extraction", {})
+        if extraction.get("signature") == "STEP61A_ALL_EFFICIENT_FEATURES_V4":
+            names = list(map(str, manifest["names"]))
+            residual = torch.from_numpy(np.load(l10_path, mmap_mode="r"))
+            pooled = (
+                torch.from_numpy(np.load(pooled_path, allow_pickle=False).copy())
+                .view(torch.bfloat16)
+                .to(device)
+            )
+            if tensor_content_digest(residual) != extraction["L10_content_SHA256"]:
+                raise RuntimeError("All-efficient L10 scratch digest mismatch.")
+            if tensor_content_digest(pooled) != extraction["pooled_content_SHA256"]:
+                raise RuntimeError("All-efficient pooled scratch digest mismatch.")
+            model, _processor = load_vision_model(model_dir, device)
+            model.cpu()
+            torch.cuda.empty_cache()
+            return names, residual, pooled, model, manifest
+    if require_prepared and not reconstruct:
+        raise FileNotFoundError("Execution requires prepared all-efficient scratch inputs.")
+    feature_dir.mkdir(parents=True, exist_ok=True)
+    if manifest_path.is_file() or (seed_manifest is not None and seed_manifest.is_file()):
+        source = manifest_path if manifest_path.is_file() else seed_manifest
+        seed_payload = json.loads(source.read_text(encoding="utf-8"))
+        names = list(map(str, seed_payload["names"]))
+    else:
+        prefix = ExactPrefixCache.load(old_prefix, extra_prefix)
+        names = list(prefix.names)
+        del prefix
+    model, residual, pooled, extraction = extract_l10_workspace(
+        names=names,
+        image_dir=image_dir,
+        model_dir=model_dir,
+        workspace_file=l10_path,
+        pooled_workspace_file=pooled_path,
+        device=device,
+    )
+    manifest = {
+        "names": names,
+        "extraction": extraction,
+        "source_digests": {
+            "old_PRE_LAST": sha256_file(old_prefix) if old_prefix.is_file() else "not_used_remote_reconstruction",
+            "extra_PRE_LAST": sha256_file(extra_prefix) if extra_prefix.is_file() else "not_used_remote_reconstruction",
+            "model_weights": sha256_file(model_dir / "model.safetensors"),
+        },
+    }
+    atomic_json(manifest_path, manifest)
+    model.cpu()
+    torch.cuda.empty_cache()
+    return names, residual, pooled, model, manifest
 
 
 @torch.no_grad()
